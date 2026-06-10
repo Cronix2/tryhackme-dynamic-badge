@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .badge_renderer import generate_badge
 from .cache import get_cached_badge, is_cache_valid, save_badge
@@ -41,6 +41,20 @@ app = FastAPI(
     description="Generates and serves a live PNG badge for a TryHackMe profile.",
     version="1.0.0",
 )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home() -> HTMLResponse:
+    """Landing page — lets Render (and any browser) confirm the service is up."""
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>TryHackMe Dynamic Badge</title></head>
+<body>
+  <h1>TryHackMe Dynamic Badge</h1>
+  <p>Service opérationnel.</p>
+  <p><a href="/badge.png">badge.png</a> &mdash; <a href="/health">health</a></p>
+</body>
+</html>""")
 
 
 @app.get("/badge.png", response_class=Response)
