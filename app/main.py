@@ -21,6 +21,7 @@ GET /health  — liveness check (returns JSON {"status": "ok"}).
 from __future__ import annotations
 
 import logging
+import traceback
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -28,7 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from .badge_renderer import generate_badge
 from .cache import get_cached_badge, is_cache_valid, save_badge
 from .config import CACHE_DIR, CACHE_MAX_AGE_HOURS, THM_USERNAME
-from .scraper import fetch_user_profile
+from .scraper import _HEADERS, _IMPERSONATE, _TIMEOUT, fetch_user_profile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,3 +126,87 @@ async def get_badge() -> Response:
 async def health_check() -> dict[str, str]:
     """Liveness / readiness probe endpoint."""
     return {"status": "ok", "username": THM_USERNAME or "(not configured)"}
+
+
+@app.get("/debug/thm")
+async def debug_thm() -> dict:
+    """
+    Diagnostic endpoint — attempts a raw HTTP call to each TryHackMe
+    endpoint and returns full details (status code, headers, body excerpt,
+    errors) so cloud-platform failures can be diagnosed without a local
+    repro.  Does NOT hit the badge cache.
+    """
+    from curl_cffi import requests as creq  # local import to keep scope clean
+
+    username = THM_USERNAME or "Cronix3"
+    endpoints = [
+        f"https://tryhackme.com/api/v2/public-profile?username={username}",
+        f"https://tryhackme.com/api/discord/user/{username}",
+    ]
+
+    results = []
+    for url in endpoints:
+        entry: dict = {"url": url}
+        try:
+            resp = creq.get(
+                url,
+                headers=_HEADERS,
+                impersonate=_IMPERSONATE,
+                timeout=_TIMEOUT,
+            )
+            diag_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() in {
+                    "content-type", "cf-ray", "cf-cache-status", "server",
+                    "x-vercel-id", "x-vercel-cache", "location",
+                    "set-cookie", "www-authenticate", "x-ratelimit-limit",
+                }
+            }
+            try:
+                body_json = resp.json()
+                body_repr = body_json
+            except Exception:
+                body_repr = resp.text[:500]
+
+            entry.update({
+                "status_code": resp.status_code,
+                "final_url": str(resp.url),
+                "content_length": len(resp.content),
+                "diag_headers": diag_headers,
+                "body_preview": body_repr,
+                "error": None,
+            })
+        except Exception as exc:
+            entry.update({
+                "status_code": None,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            })
+        results.append(entry)
+
+    # Also try to build a full profile to see if the whole pipeline works.
+    profile_summary: dict = {}
+    try:
+        profile = fetch_user_profile(username)
+        profile_summary = {
+            "ok": True,
+            "rank": profile.rank,
+            "top_percentage": profile.top_percentage,
+            "streak": profile.streak,
+            "badge_count": profile.badge_count,
+            "completed_rooms": profile.completed_rooms,
+            "capability_score": profile.capability_score,
+            "total_points": profile.total_points,
+            "level": profile.level,
+            "level_label": profile.level_label,
+        }
+    except Exception as exc:
+        profile_summary = {"ok": False, "error": str(exc)}
+
+    return {
+        "configured_username": username,
+        "impersonate": _IMPERSONATE,
+        "timeout": _TIMEOUT,
+        "endpoints": results,
+        "pipeline": profile_summary,
+    }

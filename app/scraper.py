@@ -24,6 +24,7 @@ is unavailable. Used to populate any missing UserProfile fields.
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -35,13 +36,28 @@ _BASE = "https://tryhackme.com"
 _V2_PROFILE = _BASE + "/api/v2/public-profile?username={username}"
 _DISCORD_API = _BASE + "/api/discord/user/{username}"
 
-_TIMEOUT = 20
-_IMPERSONATE = "chrome"  # spoofs Chrome's TLS + HTTP/2 fingerprint
+_TIMEOUT = 30
+# chrome136 = most recent fingerprint supported by curl_cffi; falls back
+# gracefully to the closest available version at runtime.
+_IMPERSONATE = "chrome136"
 
 _HEADERS: dict[str, str] = {
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
     "Referer": _BASE + "/",
+    "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
 
 
@@ -146,7 +162,8 @@ def fetch_user_profile(username: str) -> UserProfile:
             _apply_v2_profile(payload, profile)
             success_count += 1
     except Exception as exc:
-        logger.warning("v2 public-profile endpoint failed: %s", exc)
+        logger.error("[THM] v2 endpoint failed: %s\n%s",
+                     exc, traceback.format_exc())
 
     # Fallback — discord endpoint (fills any gaps)
     try:
@@ -154,7 +171,8 @@ def fetch_user_profile(username: str) -> UserProfile:
         _apply_discord(data, profile)
         success_count += 1
     except Exception as exc:
-        logger.warning("discord fallback endpoint failed: %s", exc)
+        logger.error("[THM] discord endpoint failed: %s\n%s",
+                     exc, traceback.format_exc())
 
     if success_count == 0:
         raise RuntimeError(
@@ -180,19 +198,65 @@ def fetch_user_profile(username: str) -> UserProfile:
 
 
 def _get_json(url: str) -> dict[str, Any]:
-    """GET *url* with browser TLS impersonation and parse the JSON body."""
-    logger.debug("GET %s", url)
-    resp = creq.get(
-        url,
-        headers=_HEADERS,
-        impersonate=_IMPERSONATE,
-        timeout=_TIMEOUT,
+    """
+    GET *url* with browser TLS impersonation and parse the JSON body.
+
+    Logs a comprehensive diagnostic block at INFO level so that failures
+    on cloud platforms (Render, Railway, etc.) are traceable in the log
+    stream without needing a local repro.
+    """
+    logger.info("[THM] --> GET %s  (impersonate=%s, timeout=%ss)",
+                url, _IMPERSONATE, _TIMEOUT)
+    try:
+        resp = creq.get(
+            url,
+            headers=_HEADERS,
+            impersonate=_IMPERSONATE,
+            timeout=_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.error(
+            "[THM] NETWORK ERROR for %s\n"
+            "  type : %s\n"
+            "  detail: %s\n"
+            "  trace :\n%s",
+            url, type(exc).__name__, exc, traceback.format_exc(),
+        )
+        raise
+
+    # ── Diagnostic block ────────────────────────────────────────────────────
+    ctype = resp.headers.get("Content-Type", "<none>")
+    body_preview = resp.text[:500].replace("\n", " ") if resp.text else "<empty>"
+    diag_headers = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() in {
+            "content-type", "cf-ray", "cf-cache-status", "server",
+            "x-vercel-id", "x-vercel-cache", "location",
+            "set-cookie", "www-authenticate", "x-ratelimit-limit",
+        }
+    }
+    logger.info(
+        "[THM] <-- %s  %s bytes  Content-Type=%s\n"
+        "  url-final  : %s\n"
+        "  diag-hdrs  : %s\n"
+        "  body[0:500]: %s",
+        resp.status_code, len(resp.content), ctype,
+        resp.url, diag_headers, body_preview,
     )
-    resp.raise_for_status()
-    if "json" not in resp.headers.get("Content-Type", ""):
+    # ────────────────────────────────────────────────────────────────────────
+
+    if resp.status_code in (301, 302, 307, 308):
+        location = resp.headers.get("location", "<no Location header>")
         raise RuntimeError(
-            f"Non-JSON response from {url} "
-            f"(Content-Type={resp.headers.get('Content-Type', '?')})"
+            f"Unexpected redirect {resp.status_code} from {url} → {location}"
+        )
+
+    resp.raise_for_status()
+
+    if "json" not in ctype:
+        raise RuntimeError(
+            f"Non-JSON response from {url}  (Content-Type={ctype})\n"
+            f"Body preview: {body_preview}"
         )
     return resp.json()
 
